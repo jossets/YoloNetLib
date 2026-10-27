@@ -1,0 +1,17 @@
+services:
+  coturn:
+    image: coturn/coturn:4.12
+    container_name: coturn
+
+    network_mode: host
+
+    restart: unless-stopped
+
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

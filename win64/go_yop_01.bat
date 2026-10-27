@@ -1,0 +1,1 @@
+YoloNetLibMinimal.exe -screen-fullscreen 0 -screen-height 900 -screen-width 1600 --pseudo Yop_01 

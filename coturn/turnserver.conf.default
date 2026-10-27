@@ -1,0 +1,21 @@
+# Your server fqdn 
+realm=coturn.server.my
+fingerprint
+
+
+listening-port=3478
+
+min-port=50000
+max-port=51000
+
+# Your server shared secret with clients 
+use-auth-secret
+static-auth-secret=COTURN_SECRET
+
+#lt-cred-mech
+#user=user01:user01Password
+#user=user02:user02Password
+
+verbose
+log-level=3
+simple-log
