@@ -4,17 +4,21 @@ Librairie temps réel multi joueur
 
 ## Server
 
-Installer coturn (écoute sur le port 3478) et lobby_server (ws sur le port 18080) sur le serveur.
+Tout tourne en Docker, depuis le répertoire `coturn` :
+- traefik : wss://LOBBY_DOMAIN/ws (ports 80/443, certificat Let's Encrypt)
+- lobby : lobby_server, joignable uniquement via Traefik (plus de port 18080 exposé)
+- coturn : STUN/TURN sur le port 3478, relais UDP 50000-51000
 
-Copier turnserver.conf.default en turnserver.conf
-Mettre à jour fqdn et secret dans turnserver.conf 
+Ports à ouvrir sur le pare-feu : TCP 80, 443, 3478 et UDP 3478, 50000-51000.
+
+Copier .env.example en .env, renseigner LOBBY_DOMAIN et ACME_EMAIL.
+Copier turnserver.conf.default en turnserver.conf, mettre à jour fqdn et secret
+(secret aléatoire, par ex. `openssl rand -hex 32`). C'est le seul endroit où le secret est défini :
+le lobby le lit dans ce fichier pour générer des identifiants TURN éphémères (12 h) qu'il envoie aux clients.
 
 ```
 cd coturn
-docker compose up -d 
-
-cd ../lobby_server 
-./start.sh 
+docker compose up -d --build --pull always
 ```
 
 
@@ -24,13 +28,10 @@ Dans Unity:
 Ajouter le script MyYoloNetMgr sur un objet.
 Copier le répertoire Assets/plugins dans le répertoire Assets du projet.
 
-Dans turn.cs mettre à jour fqdn et secret.
-class TurnIf
-{
-    const string TurnSecret  = "COTURN_SECRET";
-    const string TurnHost    = "host";
-    ..
-}
+Dans client.cs, `serverUrl` pointe vers le lobby (wss://LOBBY_DOMAIN/ws).
+Rien d'autre à configurer : les serveurs STUN/TURN et leurs identifiants sont reçus du lobby à chaque join.
+
+Le pseudo et le nom de room n'acceptent que `A-Z a-z 0-9 _ -` (32 caractères max).
 
 Le nom de l'utilisateur est, dans l'ordre :
 - généré aléatoirement

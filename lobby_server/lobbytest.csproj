@@ -7,8 +7,4 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="SIPSorcery" Version="10.0.8" />
-  </ItemGroup>
-
 </Project>

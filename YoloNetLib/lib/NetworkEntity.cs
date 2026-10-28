@@ -7,7 +7,7 @@ using UnityEngine;
 public class NetworkEntityIdGenerator
 {
     static long Id = 0;
-    static public long AllocateId() { Id++; return Id; }
+    static public long AllocateId() => System.Threading.Interlocked.Increment(ref Id);
 }
 
 public class NetworkEntityFactory
@@ -18,23 +18,38 @@ public class NetworkEntityFactory
     static readonly Dictionary<long, WeakReference<NetworkEntity>> entities =
         new Dictionary<long, WeakReference<NetworkEntity>>();
 
+    // Accédé depuis le thread Unity, les threads réseau et le thread du finalizer
+    static readonly object entitiesLock = new object();
+
     // Retourne l'entité ou null si l'id est inconnu / déjà collectée
     public static NetworkEntity GetById(long id)
     {
         WeakReference<NetworkEntity> wr;
         NetworkEntity e;
-        return entities.TryGetValue(id, out wr) && wr.TryGetTarget(out e) ? e : null;
+        lock (entitiesLock)
+            return entities.TryGetValue(id, out wr) && wr.TryGetTarget(out e) ? e : null;
     }
 
     // Retourne l'entité castée dans le type demandé, ou null
     public static T GetById<T>(long id) where T : NetworkEntity =>
         GetById(id) as T;
 
-    public static void Register(NetworkEntity entity) =>
-        entities[entity.NetId] = new WeakReference<NetworkEntity>(entity);
+    public static void Register(NetworkEntity entity)
+    {
+        lock (entitiesLock)
+            entities[entity.NetId] = new WeakReference<NetworkEntity>(entity);
+    }
 
-    public static void Deregister(NetworkEntity entity) =>
-        entities.Remove(entity.NetId);
+    // Ne retire l'entrée que si elle pointe bien sur cette entité (ou sur une entité morte)
+    public static void Deregister(NetworkEntity entity)
+    {
+        lock (entitiesLock)
+        {
+            if (entities.TryGetValue(entity.NetId, out var wr) &&
+                (!wr.TryGetTarget(out var current) || ReferenceEquals(current, entity)))
+                entities.Remove(entity.NetId);
+        }
+    }
 }
 
 public class NetworkEntity
@@ -55,6 +70,7 @@ public class NetworkEntity
     // Cache statique : évite de recréer JsonSerializerOptions à chaque appel
     static readonly JsonSerializerOptions JsonOpts = new();
 
+    // Entité locale : alloue un NetId et l'enregistre dans la factory
     public NetworkEntity(string prefabType)
     {
         NetId      = NetworkEntityIdGenerator.AllocateId();
@@ -62,19 +78,20 @@ public class NetworkEntity
         PrefabType = prefabType;
         EventType = EnumEventType.Create;
         NetworkEntityFactory.Register(this);
+        _registered = true;
     }
-    public static NetworkEntity AllocateFromJSON(string prefabType, string json)
-    {
-        NetworkEntity ne = new NetworkEntity(prefabType);
-        //Debug.Log("AllocateFromJSON json : "+json);
-        var data = JsonSerializer.Deserialize<NetworkEntity>(json);
-        //Debug.Log("AllocateFromJSON data : "+data.Serialize());
-        
-        return data;
-    }
+
+    // Utilisé par System.Text.Json : copie d'une entité distante, sans NetId local ni enregistrement
+    public NetworkEntity() { }
+
+    bool _registered;
+
+    public static NetworkEntity AllocateFromJSON(string prefabType, string json) =>
+        JsonSerializer.Deserialize<NetworkEntity>(json, JsonOpts);
+
     ~NetworkEntity()
     {
-        NetworkEntityFactory.Deregister(this);
+        if (_registered) NetworkEntityFactory.Deregister(this);
     }
 
     public string Serialize() => JsonSerializer.Serialize(this, GetType(), JsonOpts);

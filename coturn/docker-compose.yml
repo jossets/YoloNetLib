@@ -1,17 +1,101 @@
+# Déploiement serveur : Traefik (wss://) + lobby + coturn
+#   cp .env.example .env            (puis renseigner LOBBY_DOMAIN et ACME_EMAIL)
+#   cp turnserver.conf.default turnserver.conf   (puis realm + secret)
+#   docker compose up -d --build --pull always
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
-  coturn:
-    image: coturn/coturn:4.12
-    container_name: coturn
-
-    network_mode: host
-
+  traefik:
+    image: traefik:v3.7.16
+    container_name: traefik
     restart: unless-stopped
+    command:
+      - --global.checknewversion=false
+      - --global.sendanonymoususage=false
+      - --log.level=INFO
+      # Seuls les conteneurs avec traefik.enable=true sont exposés
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=lobby_net
+      # HTTP → HTTPS
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Le readTimeout par défaut (60 s) couperait la WebSocket chaque minute → reconnexion et perte des pairs P2P.
+      # Le lobby coupe lui-même une connexion inactive après 30 s.
+      - --entrypoints.websecure.transport.respondingTimeouts.readTimeout=0
+      # Certificat Let's Encrypt (challenge HTTP sur le port 80)
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL:?ACME_EMAIL manquant dans .env}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    networks:
+      - lobby_net
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
 
+  lobby:
+    build: ../lobby_server
+    image: yolonet-lobby
+    container_name: lobby
+    restart: unless-stopped
+    # Pas de "ports:" : le lobby n'est joignable que par Traefik, sur le réseau lobby_net
+    environment:
+      LOBBY_TRUSTED_PROXY_NETWORK: 172.30.0.0/24
+      # Identifiants TURN éphémères envoyés aux clients ; le secret est lu dans turnserver.conf
+      TURN_HOST: ${TURN_HOST:-${LOBBY_DOMAIN}}
+      TURN_PORT: "3478"
+      TURN_TTL_HOURS: "12"
+      TURN_CONFIG_FILE: /etc/coturn/turnserver.conf
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    networks:
+      - lobby_net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.lobby.rule=Host(`${LOBBY_DOMAIN:?LOBBY_DOMAIN manquant dans .env}`) && Path(`/ws`)"
+      - traefik.http.routers.lobby.entrypoints=websecure
+      - traefik.http.routers.lobby.tls.certresolver=le
+      - traefik.http.services.lobby.loadbalancer.server.port=18080
+    logging: *logging
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+  coturn:
+    # 4.12 → 4.18.0 : corrige plusieurs advisories High (MOBILITY-TICKET, ACME, DTLS) et
+    # le contournement de denied-peer-ip en IPv6 (GHSA-4v97-rxjj-4f99)
+    image: coturn/coturn:4.18.0
+    container_name: coturn
+    # UDP 3478 + plage de relais 50000-51000 : réseau hôte, pas de passage par Traefik
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    logging: *logging
+
+networks:
+  lobby_net:
+    name: lobby_net
+    # Sous-réseau fixe : le lobby ne fait confiance à X-Forwarded-For que depuis ce réseau
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

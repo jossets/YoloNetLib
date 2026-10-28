@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.WebSockets;
@@ -11,11 +12,12 @@ using System.Threading.Tasks;
 using SIPSorcery.Net;
 using UnityEngine;
 
-class ProgramClient
+partial class ProgramClient
 {
     static ClientWebSocket ws;
     static CancellationTokenSource cts = new CancellationTokenSource();
-    static string serverUrl = "ws://ysh2.yolospacehacker.com:18080/ws";
+    // wss via Traefik (443) : le SDP contient le mot de passe ICE et l'empreinte DTLS, il ne doit pas circuler en clair
+    public static string ServerUrl = "wss://ysh2.yolospacehacker.com/ws";
     public static string currentRoom;
     public static string myName;
     static string roomOwner;
@@ -37,11 +39,10 @@ class ProgramClient
         myName != null && myName == roomOwner && currentRoom != null;
 
     static readonly Dictionary<string, RTCPeerConnection> peers        = new Dictionary<string, RTCPeerConnection>();
-    static readonly Dictionary<string, RTCDataChannel>    dataChannels = new Dictionary<string, RTCDataChannel>();
+    static readonly Dictionary<string, RTCDataChannel>    dataChannels = new Dictionary<string, RTCDataChannel>();   // "lobby" : chat, événements (JSON)
+    static readonly Dictionary<string, RTCDataChannel>    stateChannels = new Dictionary<string, RTCDataChannel>();  // "state" : transforms (binaire)
     static readonly Dictionary<string, List<string>>      earlyIce     = new Dictionary<string, List<string>>();
     static readonly object peersLock = new object();
-
-    static volatile TaskCompletionSource<List<string>> pendingRoomsList;
 
     // ------------------------------------------------------------------ //
     // MODE AUTO (appelé depuis Unity)
@@ -53,10 +54,32 @@ class ProgramClient
         if (cts.IsCancellationRequested)
             cts = new CancellationTokenSource();
 
-        
-        if (myName=="") myName = GenerateName();
-        Log($"[AUTO] Nom généré : {myName}");
-        await ConnectLoop(myName, auto: true);
+        var requested = myName;
+        myName = SanitizeName(myName);
+        if (string.IsNullOrEmpty(myName)) myName = GenerateName();
+        if (myName != requested && !string.IsNullOrEmpty(requested))
+            Log($"[AUTO] Pseudo '{requested}' adapté en '{myName}' (le lobby n'accepte que A-Z a-z 0-9 _ -)");
+        Log($"[AUTO] Nom : {myName}");
+        await ConnectLoop(auto: true);
+    }
+
+    // Mêmes règles que le lobby : [A-Za-z0-9_-]{1,32}. "Sébastien L." → "Sebastien_L_"
+    public const int MaxNameLength = 32;
+    public const int MaxRoomLength = 48;
+    public static string SanitizeName(string name) => SanitizeIdentifier(name, MaxNameLength);
+    public static string SanitizeRoomName(string room) => SanitizeIdentifier(room, MaxRoomLength);
+
+    static string SanitizeIdentifier(string name, int maxLength)
+    {
+        if (string.IsNullOrEmpty(name)) return "";
+        var sb = new StringBuilder();
+        foreach (var c in name.Normalize(NormalizationForm.FormD))
+        {
+            if (CharUnicodeInfo.GetUnicodeCategory(c) == UnicodeCategory.NonSpacingMark) continue; // accents
+            sb.Append(c < 128 && (char.IsLetterOrDigit(c) || c == '_' || c == '-') ? c : '_');
+            if (sb.Length == maxLength) break;
+        }
+        return sb.ToString();
     }
 
     static string GenerateName()
@@ -68,91 +91,52 @@ class ProgramClient
     }
 
     // ------------------------------------------------------------------ //
-    // AUTO CONNECT FLOW
-    // ------------------------------------------------------------------ //
-
-    static async Task AutoConnectFlow(string name)
-    {
-        Log("[AUTO] Demande de la liste des rooms...");
-
-        pendingRoomsList = new TaskCompletionSource<List<string>>();
-        var roomsTask = pendingRoomsList.Task;   // capture avant que ReceiveLoop le null-ise
-        await Send(new Msg { Type = "list_rooms" });
-
-        List<string> rooms;
-        try
-        {
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-            var completed   = await Task.WhenAny(roomsTask, timeoutTask);
-            if (completed == timeoutTask) throw new TimeoutException();
-            rooms = roomsTask.Result;
-        }
-        catch (TimeoutException)
-        {
-            Log("[AUTO] Timeout : pas de réponse du serveur.");
-            return;
-        }
-
-        if (rooms.Count == 0)
-        {
-            var roomName = $"room_{name}";
-            Log($"[AUTO] Aucune room active → création de '{roomName}'");
-            await Send(new Msg { Type = "join", Name = name, Room = roomName });
-            currentRoom = roomName;
-        }
-        else
-        {
-            var roomName = rooms[0].Split(' ')[0];
-            Log($"[AUTO] Room trouvée → rejoins '{roomName}'");
-            await Send(new Msg { Type = "join", Name = name, Room = roomName });
-            currentRoom = roomName;
-            await Task.Delay(300);
-            await Send(new Msg { Type = "chat", Name = name, Room = roomName, Text = "bonjour" });
-        }
-    }
-
-    // ------------------------------------------------------------------ //
     // BOUCLE DE CONNEXION
     // ------------------------------------------------------------------ //
 
-    static async Task ConnectLoop(string name, bool auto = false)
+    static async Task ConnectLoop(bool auto = false)
     {
         bool firstConnect = true;
 
         while (!cts.IsCancellationRequested)
         {
             CloseAllPeers();
+            // Token propre à cette connexion : arrête le heartbeat quand elle tombe
+            using var connCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
             try
             {
                 ws = new ClientWebSocket();
                 Log("Connexion...");
-                await ws.ConnectAsync(new Uri(serverUrl), cts.Token);
+                await ws.ConnectAsync(new Uri(ServerUrl), cts.Token);
                 Log("Connecté");
 
+                // Reconnexion : rejoindre la room courante (jeton de reconnexion : ni code ni nouvelle validation)
                 if (currentRoom != null)
-                    await Send(new Msg { Type = "join", Name = name, Room = currentRoom });
+                    await Send(RejoinMessage());
 
-                var receiveTask   = ReceiveLoop();
-                var heartbeatTask = HeartbeatLoop();
+                var receiveTask = ReceiveLoop();
+                _ = HeartbeatLoop(connCts.Token);
 
                 if (auto && firstConnect)
                 {
                     firstConnect = false;
-                    await AutoConnectFlow(name);
+                    await AutoConnectFlow();
                 }
 
                 await receiveTask;
 
                 if (!cts.IsCancellationRequested)
                     Log("Connexion perdue → reconnexion...");
-
-                await Task.Delay(2000);
             }
             catch (Exception ex)
             {
                 Log("Erreur: " + ex.Message);
-                await Task.Delay(2000);
             }
+            finally
+            {
+                connCts.Cancel();
+            }
+            try { await Task.Delay(2000, cts.Token); } catch (OperationCanceledException) { }
         }
     }
 
@@ -171,7 +155,7 @@ class ProgramClient
 
     static RTCPeerConnection CreatePeerConnection(string peerName)
     {
-        var pc = new RTCPeerConnection(TurnIf.GetRTCConfiguration(myName ?? ""));
+        var pc = new RTCPeerConnection(TurnIf.GetRTCConfiguration());
 
         pc.onicecandidate += cand =>
         {
@@ -195,12 +179,24 @@ class ProgramClient
         return pc;
     }
 
+    public const string StateChannelLabel = "state";
+
     static void SetupDataChannel(string peerName, RTCDataChannel dc)
     {
-        lock (peersLock) dataChannels[peerName] = dc;
-        dc.onopen  += () => Log($"[DC] {peerName} → canal ouvert");
-        dc.onclose += () => { Log($"[DC] {peerName} → canal fermé"); lock (peersLock) dataChannels.Remove(peerName); };
-        dc.onmessage += (_, _, data) => OnMessageRcv(peerName, data);
+        bool isState = dc.label == StateChannelLabel;
+        var channels = isState ? stateChannels : dataChannels;
+        lock (peersLock) channels[peerName] = dc;
+        dc.onopen  += () => Log($"[DC] {peerName}/{dc.label} → canal ouvert");
+        dc.onclose += () =>
+        {
+            Log($"[DC] {peerName}/{dc.label} → canal fermé");
+            // Ne retirer que ce canal-ci : une nouvelle connexion au même pair a pu le remplacer
+            lock (peersLock)
+                if (channels.TryGetValue(peerName, out var current) && current == dc)
+                    channels.Remove(peerName);
+        };
+        if (isState) dc.onmessage += (_, _, data) => OnStateReceived?.Invoke(peerName, data);
+        else         dc.onmessage += (_, _, data) => OnMessageRcv(peerName, data);
     }
 
     static void OnMessageRcv(string peerName, byte[] data)
@@ -231,7 +227,7 @@ class ProgramClient
             //Log($"Client.OnMessageRcv try deserialize");
             var msg = JsonSerializer.Deserialize<Msg>(text);
             if (msg?.Type == "chat") {
-                OnChatReceived?.Invoke(peerName, text);
+                OnChatReceived?.Invoke(peerName, msg.Text ?? "");
             }
             else if (msg?.Type == "entity" && msg.EntityType != null && msg.EntityData != null)
             {
@@ -262,6 +258,19 @@ class ProgramClient
 
     public static event Action<string, NetworkEntity> OnEntityReceived;
     public static event Action<string, string> OnChatReceived;
+    public static event Action<string> OnPeerLeft;   // nom du pair parti (thread réseau)
+    public static event Action<string> OnServerError; // message "error" du lobby (thread réseau)
+    public static event Action<string, byte[]> OnStateReceived; // paquet binaire du canal "state" (thread réseau, données non fiables : à valider)
+
+    // Envoie un paquet binaire (TransformCodec) à tous les pairs sur le canal "state"
+    public static void BroadcastState(byte[] packet)
+    {
+        List<RTCDataChannel> open;
+        lock (peersLock) open = new List<RTCDataChannel>(stateChannels.Values);
+        foreach (var dc in open)
+            if (dc.readyState == RTCDataChannelState.open)
+                dc.send(packet);
+    }
 
     public static bool SendEntityTo(string peerName, NetworkEntity entity)
     {
@@ -315,6 +324,11 @@ class ProgramClient
         var pc = CreatePeerConnection(peerName);
         var dc = await pc.createDataChannel("lobby");
         SetupDataChannel(peerName, dc);
+        // Canal dédié aux transforms. SIPSorcery 10.0.x ignore ordered/maxRetransmits à l'envoi
+        // (toujours fiable et ordonné) : on ne gagne pas l'UDP pur, mais un flux SCTP séparé,
+        // donc une position retransmise ne bloque pas les événements du canal "lobby".
+        var state = await pc.createDataChannel(StateChannelLabel);
+        SetupDataChannel(peerName, state);
         var offer = pc.createOffer();
         await pc.setLocalDescription(offer);
         await Send(new Msg { Type = "offer", To = peerName, From = myName, Sdp = offer.sdp });
@@ -379,6 +393,7 @@ class ProgramClient
                 try { pc.close(); } catch { }
             peers.Clear();
             dataChannels.Clear();
+            stateChannels.Clear();
             earlyIce.Clear();
         }
     }
@@ -419,14 +434,6 @@ class ProgramClient
                     if (LogChat) Log($"[{data.Room}] {data.Text}");
                     break;
                 case "system":       Log($"[SYSTÈME] {data.Text}"); break;
-                case "room_info":
-                    roomOwner = data.Owner;
-                    Log(AmIRoomOwner() ? $"[ROOM] {data.Room} — propriétaire" : $"[ROOM] {data.Room} — owner: {data.Owner}");
-                    break;
-                case "owner_changed":
-                    roomOwner = data.Owner;
-                    Log(AmIRoomOwner() ? $"[ROOM] Vous êtes le nouveau propriétaire de '{data.Room}'" : $"[ROOM] {data.Text}");
-                    break;
                 case "peer_joined":
                     Log($"[SYSTÈME] {data.Text}");
                     if (data.Name != null && data.Name != myName) _ = InitiateOffer(data.Name);
@@ -436,8 +443,16 @@ class ProgramClient
                     if (data.Name != null)
                     {
                         RTCPeerConnection gone;
-                        lock (peersLock) { peers.TryGetValue(data.Name, out gone); peers.Remove(data.Name); }
+                        lock (peersLock)
+                        {
+                            peers.TryGetValue(data.Name, out gone);
+                            peers.Remove(data.Name);
+                            dataChannels.Remove(data.Name);
+                            stateChannels.Remove(data.Name);
+                            earlyIce.Remove(data.Name);
+                        }
                         try { gone?.close(); } catch { }
+                        OnPeerLeft?.Invoke(data.Name);
                     }
                     break;
                 case "offer":
@@ -459,27 +474,27 @@ class ProgramClient
                     break;
                 case "pong":
                     if (data.Timestamp.HasValue)
-                        Log($"[PING] {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.Timestamp.Value} ms");
+                        LastRttMs = (int)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - data.Timestamp.Value);
                     break;
-                case "rooms":
-                    var waiter = pendingRoomsList;
-                    pendingRoomsList = null;
-                    if (waiter != null)
-                        waiter.TrySetResult(data.Rooms ?? new List<string>());
-                    else if (data.Rooms?.Count > 0)
-                        foreach (var r in data.Rooms) Log($"  • {r}");
+                default:
+                    // room_info, rooms, error, join_*, room_updated, owner_changed : ClientRooms.cs
+                    HandleRoomMessage(data);
                     break;
             }
         }
     }
 
-    static async Task HeartbeatLoop()
+    // Aller-retour client ↔ lobby mesuré par le heartbeat (-1 = pas encore mesuré)
+    public static volatile int LastRttMs = -1;
+
+    static async Task HeartbeatLoop(CancellationToken ct)
     {
-        while (!cts.Token.IsCancellationRequested)
+        while (!ct.IsCancellationRequested)
         {
-            await Task.Delay(5000);
+            try { await Task.Delay(5000, ct); }
+            catch (OperationCanceledException) { return; }
             if (ws?.State == WebSocketState.Open)
-                await Send(new Msg { Type = "ping" });
+                await Send(new Msg { Type = "ping", Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
         }
     }
 
@@ -534,7 +549,7 @@ class Msg
     [JsonPropertyName("room")]       public string       Room       { get; set; }
     [JsonPropertyName("name")]       public string       Name       { get; set; }
     [JsonPropertyName("text")]       public string       Text       { get; set; }
-    [JsonPropertyName("rooms")]      public List<string> Rooms      { get; set; }
+    [JsonPropertyName("rooms")]      public List<RoomSummary> Rooms { get; set; }
     [JsonPropertyName("ts")]         public long?        Timestamp  { get; set; }
     [JsonPropertyName("candidates")] public List<string> Candidates { get; set; }
     [JsonPropertyName("sdp")]        public string       Sdp        { get; set; }
@@ -544,4 +559,12 @@ class Msg
     [JsonPropertyName("owner")]       public string       Owner      { get; set; }
     [JsonPropertyName("entity_type")] public string       EntityType { get; set; }
     [JsonPropertyName("entity_data")] public string       EntityData { get; set; }
+    [JsonPropertyName("ice_servers")] public List<IceServerInfo> IceServers { get; set; }
+    // Rooms : visibilité ("public"/"private"), places, code d'invitation, jeton de reconnexion, décision de l'owner
+    [JsonPropertyName("visibility")]  public string       Visibility { get; set; }
+    [JsonPropertyName("max_players")] public int?         MaxPlayers { get; set; }
+    [JsonPropertyName("players")]     public int?         Players    { get; set; }
+    [JsonPropertyName("code")]        public string       Code       { get; set; }
+    [JsonPropertyName("token")]       public string       Token      { get; set; }
+    [JsonPropertyName("accept")]      public bool?        Accept     { get; set; }
 }

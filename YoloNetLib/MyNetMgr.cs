@@ -2,20 +2,12 @@ using UnityEngine;
 
 public class MyNetMgr : NetMgr
 {
-    // Start is called once before the first execution of Update after the MonoBehaviour is created
-    void Start()
-    {
-        
-    }
-
-    // Update is called once per frame
-    void Update()
-    {
-        
-    }
+    // Ne pas déclarer de Start()/Update() vides ici : ils masqueraient ceux de NetMgr
+    // et le réseau ne démarrerait jamais. Pour en ajouter : override + base.Start()/base.Update().
 
     public override void OnRcvNetworkEntity(string from, NetworkEntity ne)
     {
         Debug.Log("MyNetMgr Receive NE : "+ne.Name);
+        base.OnRcvNetworkEntity(from, ne);
     }
 }

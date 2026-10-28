@@ -1,1 +1,3 @@
 turnserver.conf
+.env
+letsencrypt/

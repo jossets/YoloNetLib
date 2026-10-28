@@ -16,6 +16,9 @@ public class NEPlayer : MonoBehaviour
             Z = z;
         }
 
+        // Pour System.Text.Json : pas d'allocation de NetId à la réception
+        public NEPlayerElement() { }
+
         public static NEPlayerElement Deserialize(string json) => DeserializeChecked<NEPlayerElement>(json);
 
         public override void DeSerialize(string jsonString)

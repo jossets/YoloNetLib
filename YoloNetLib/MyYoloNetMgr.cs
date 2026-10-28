@@ -1,159 +1,101 @@
 using UnityEngine;
-using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Text.Json;
 
+// Exemple : synchronise les objets taggés "Player" en P2P (canal "state", binaire)
+// et affiche les joueurs distants sous forme de cubes rouges.
 public class MyYoloNetMgr : YoloNetMgr
 {
     private float lastSend = 0f;
-    public float SecondBetweenSend = 1.0f;
+    public float SecondBetweenSend = 0.1f;
 
-    // Dernière position reçue par joueur distant (écrite par le thread réseau).
-    // Seule la plus récente compte : les positions intermédiaires sont écrasées.
-    private readonly ConcurrentDictionary<string, Vector3> latestPositions =
-        new ConcurrentDictionary<string, Vector3>();
+    // NetId réseau de chaque objet local synchronisé
+    private readonly Dictionary<GameObject, long> localNetIds = new Dictionary<GameObject, long>();
+    private readonly Dictionary<GameObject, ushort> localSeqs = new Dictionary<GameObject, ushort>();
 
-    // Cache des cubes distants, évite un GameObject.Find par message.
-    private readonly Dictionary<string, GameObject> remotePlayers =
-        new Dictionary<string, GameObject>();
+    // Cubes des joueurs distants, par "pair/NetId"
+    private readonly Dictionary<string, GameObject> remotePlayers = new Dictionary<string, GameObject>();
+    private readonly Dictionary<string, ushort> remoteSeqs = new Dictionary<string, ushort>();
 
-    void Update()
+    protected override void Update()
     {
-        // 1. Appliquer la dernière position connue de chaque joueur distant.
-        foreach (string remoteObjName in latestPositions.Keys)
+        base.Update(); // traite les files de YoloNetMgr → OnRcvTransform, OnPeerLeft...
+
+        if ((Time.time - lastSend) < SecondBetweenSend)
+            return;
+        lastSend = Time.time;
+
+        // Envoyer les positions des joueurs locaux (envoi groupé en LateUpdate par YoloNetMgr)
+        foreach (GameObject obj in GameObject.FindGameObjectsWithTag("Player"))
         {
-            if (!latestPositions.TryRemove(remoteObjName, out Vector3 remotePosition))
-                continue;
+            if (!localNetIds.TryGetValue(obj, out long netId))
+                localNetIds[obj] = netId = NetworkEntityIdGenerator.AllocateId();
 
-            if (!remotePlayers.TryGetValue(remoteObjName, out GameObject remotePlayer) || remotePlayer == null)
+            localSeqs.TryGetValue(obj, out ushort seq);
+            localSeqs[obj] = ++seq;
+
+            TransformBroadcaster.Queue(new TransformState
             {
-                // Créer le cube distant.
-                remotePlayer = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                remotePlayer.name = remoteObjName;
-
-                // Appliquer la couleur rouge.
-                Renderer renderer = remotePlayer.GetComponent<Renderer>();
-                if (renderer != null)
-                    renderer.material.color = Color.red;
-
-                remotePlayers[remoteObjName] = remotePlayer;
-            }
-
-            // Mettre à jour sa position.
-            remotePlayer.transform.position = remotePosition;
-        }
-
-        // 2. Envoyer les positions toutes les secondes.
-        if ((Time.time - lastSend) > SecondBetweenSend)
-        {
-            // Envoyer l'heure.
-            ProgramClient.Send(new Msg
-            {
-                Type = "chat",
-                Name = ProgramClient.myName,
-                Room = ProgramClient.currentRoom,
-                Text = "TIME " + Time.time.ToString()
+                NetId       = netId,
+                Seq         = seq,
+                PrefabType  = "Player",
+                HasPosition = true,
+                Position    = obj.transform.position,
             });
-
-            // Envoyer les positions des joueurs locaux.
-            GameObject[] objs =
-                GameObject.FindGameObjectsWithTag("Player");
-
-            foreach (GameObject obj in objs)
-            {
-                Vector3 position = obj.transform.position;
-
-                NEVect3D pos = new NEVect3D(
-                    position.x,
-                    position.y,
-                    position.z
-                );
-
-                string json_pos = JsonSerializer.Serialize(pos);
-
-                ProgramClient.Send(new Msg
-                {
-                    Type = "chat",
-                    Name = ProgramClient.myName,
-                    Room = ProgramClient.currentRoom,
-                    Text = "OBJPOS " + obj.name + " " + json_pos
-                });
-            }
-
-            lastSend = Time.time;
         }
     }
 
-    public override void OnRcvChat(string _from, string _text)
+    public override void OnRcvTransform(string from, TransformState state)
     {
-        string from = _from;
-        string text = _text;
+        string key = from + "/" + state.NetId;
 
-        // Si l'émetteur est inclus dans le texte, l'extraire.
-        if (from == "")
+        // Ignorer un état plus ancien que le dernier appliqué
+        if (remoteSeqs.TryGetValue(key, out ushort last) && !TransformState.IsNewer(state.Seq, last))
+            return;
+        remoteSeqs[key] = state.Seq;
+
+        if (!remotePlayers.TryGetValue(key, out GameObject remotePlayer) || remotePlayer == null)
         {
-            int index = text.IndexOf(":");
-
-            if (index != -1)
-            {
-                from = text.Substring(0, index).Trim();
-                text = text.Substring(index + 1).Trim();
-            }
+            // Créer le cube distant, en rouge
+            remotePlayer = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            remotePlayer.name = key;
+            Renderer renderer = remotePlayer.GetComponent<Renderer>();
+            if (renderer != null)
+                renderer.material.color = Color.red;
+            remotePlayers[key] = remotePlayer;
         }
 
-        // Ignorer les messages de notre propre joueur.
-        if (from == ProgramClient.myName)
-            return;
-
-        // Ne traiter que les messages de position du joueur.
-        const string prefix = "OBJPOS Player ";
-
-        if (!text.StartsWith(prefix))
-            return;
-
-        string json = text.Substring(prefix.Length).Trim();
-
-        // Désérialisation hors des opérations Unity.
-        NEVect3D pos;
-
-        try
-        {
-            pos = JsonSerializer.Deserialize<NEVect3D>(json);
-        }
-        catch (JsonException ex)
-        {
-            Debug.LogWarning("Position JSON invalide : " + ex.Message);
-            return;
-        }
-
-        if (pos == null)
-            return;
-
-        // Écrase la position précédente non encore appliquée ; Update() l'appliquera.
-        latestPositions[from + "_Player"] = pos.GetVector3();
+        if (state.HasPosition)
+            remotePlayer.transform.position = state.Position;
     }
 
-    public class NEVect3D
+    public override void OnPeerLeft(string peer)
     {
-        public float X { get; set; }
-        public float Y { get; set; }
-        public float Z { get; set; }
-
-        public NEVect3D()
+        var prefix = peer + "/";
+        var gone = new List<string>();
+        foreach (var key in remotePlayers.Keys)
+            if (key.StartsWith(prefix)) gone.Add(key);
+        foreach (var key in gone)
         {
+            if (remotePlayers[key] != null) Destroy(remotePlayers[key]);
+            remotePlayers.Remove(key);
+            remoteSeqs.Remove(key);
         }
+    }
 
-        public NEVect3D(float x, float y, float z)
-        {
-            X = x;
-            Y = y;
-            Z = z;
-        }
+    public override void OnServerError(string error)
+    {
+        Debug.LogWarning("Lobby : " + error);
+    }
 
-        public Vector3 GetVector3()
-        {
-            return new Vector3(X, Y, Z);
-        }
+    // Appelé seulement si autoRoom.Options.AutoAccept = false : brancher ici une UI de validation
+    public override void OnJoinRequest(string player)
+    {
+        Debug.Log($"{player} demande à entrer : valider avec ProgramClient.AnswerJoinRequest(player, true/false)");
+    }
+
+    public override void OnRoomJoined(RoomState room)
+    {
+        Debug.Log($"Room '{room.Name}' ({room.Visibility}, {room.Players}/{room.MaxPlayers})"
+                  + (room.Code != null ? $" — code d'invitation : {room.Code}" : ""));
     }
 }

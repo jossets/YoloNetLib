@@ -1,54 +1,44 @@
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using SIPSorcery.Net;
 using UnityEngine;
 
 record TurnInfo(string Name, List<string> Candidates, string Sdp);
 
+// Serveur ICE reçu du lobby dans room_info
+class IceServerInfo
+{
+    [JsonPropertyName("urls")]       public string Urls       { get; set; }
+    [JsonPropertyName("username")]   public string Username   { get; set; }
+    [JsonPropertyName("credential")] public string Credential { get; set; }
+}
+
 class TurnIf
 {
-    const string TurnSecret  = "COTURN_SECRET";
-    const string TurnHost    = "host";
-    const int    TurnPort    = 3478;
-    const int    TurnTtlH   = 24;
+    // Le secret coturn reste sur le serveur : le lobby envoie dans room_info des identifiants
+    // TURN éphémères (username = "<expiration>:<nom>", credential = HMAC du secret).
+    static volatile List<RTCIceServer> iceServers = new List<RTCIceServer>();
 
-    // Coturn mode use-auth-secret :
-    //   username  = timestamp Unix d'expiration (doit être dans le futur)
-    //   password  = Base64(HMAC-SHA1(secret, username))
-    static string GenerateUser(string clientName) =>
-        $"{DateTimeOffset.UtcNow.AddHours(TurnTtlH).ToUnixTimeSeconds()}:{clientName}";
+    public static void SetIceServers(List<IceServerInfo> servers)
+    {
+        var list = new List<RTCIceServer>();
+        if (servers != null)
+            foreach (var s in servers)
+                if (!string.IsNullOrEmpty(s?.Urls))
+                    list.Add(new RTCIceServer { urls = s.Urls, username = s.Username, credential = s.Credential });
+
+        iceServers = list;
+        Debug.Log(list.Count > 0
+            ? $"[TURN] {list.Count} serveur(s) ICE reçu(s) du lobby"
+            : "[TURN] aucun serveur ICE reçu : connexions directes uniquement (pas de STUN/TURN)");
+    }
 
     // Réutilisable par le signaling client pour créer des RTCPeerConnection
-    public static RTCConfiguration GetRTCConfiguration(string clientName = "")
-    {
-        var user = GenerateUser(clientName);
-        var cred = GenerateCredential(TurnSecret, user);
-        Debug.Log($"[TURN] credentials — user: {user} (expire dans {TurnTtlH}h)");
-
-        // ICE prioritise les candidats dans l'ordre : host > srflx > relay
-        // Pour relay : UDP est tenté en premier, TCP en fallback (pare-feux bloquant UDP)
-        return new RTCConfiguration
-        {
-            iceServers = new List<RTCIceServer>
-            {
-                // STUN pur — candidats server-reflexive (IP publique, sans relay)
-                new RTCIceServer { urls = $"stun:{TurnHost}:{TurnPort}" },
-
-                // TURN/UDP — relay UDP (le plus courant, faible latence)
-                new RTCIceServer { urls = $"turn:{TurnHost}:{TurnPort}?transport=udp", username = user, credential = cred },
-
-                // TURN/TCP port 3478 — fallback si UDP bloqué
-                new RTCIceServer { urls = $"turn:{TurnHost}:{TurnPort}?transport=tcp", username = user, credential = cred },
-
-                // TURNS/TLS port 443 — dernier recours (pare-feux les plus stricts)
-                // Nécessite coturn avec tls-listening-port=443 + certificat
-                // new RTCIceServer { urls = $"turns:{TurnHost}:443?transport=tcp", username = user, credential = cred },
-            }
-        };
-    }
+    // ICE prioritise les candidats dans l'ordre : host > srflx > relay
+    public static RTCConfiguration GetRTCConfiguration() =>
+        new RTCConfiguration { iceServers = new List<RTCIceServer>(iceServers) };
 
     // Usage diagnostique : collecte complète puis retourne les candidats
     public static async Task<TurnInfo> GetTurnConfig(string clientName)
@@ -76,11 +66,5 @@ class TurnIf
 
         pc.close();
         return new TurnInfo(clientName, candidates, offer.sdp);
-    }
-
-    static string GenerateCredential(string secret, string username)
-    {
-        using var hmac = new HMACSHA1(Encoding.ASCII.GetBytes(secret));
-        return Convert.ToBase64String(hmac.ComputeHash(Encoding.ASCII.GetBytes(username)));
     }
 }
